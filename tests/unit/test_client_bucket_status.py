@@ -7,6 +7,7 @@ from azure.core.exceptions import (
     ResourceNotFoundError,
 )
 from botocore.exceptions import NoCredentialsError
+from gcsfs.core import GCSFileSystem
 from gcsfs.retry import HttpError
 from google.api_core import exceptions as google_exceptions
 
@@ -127,9 +128,28 @@ def test_s3_bucket_status(mock_fs_cls, anon_effect, auth_effect, expected):
 def test_gcs_bucket_status(mock_create_fs, anon_effect, auth_effect, expected):
     anon_fs, auth_fs = MagicMock(), MagicMock()
     mock_create_fs.side_effect = [anon_fs, auth_fs]
-    anon_fs._ls = AsyncMock(side_effect=anon_effect)
+    anon_fs._call = AsyncMock(side_effect=anon_effect)
     auth_fs._info = AsyncMock(side_effect=auth_effect)
     assert GCSClient.bucket_status("b") == expected
+
+
+@patch.object(GCSClient, "create_fs")
+def test_gcs_bucket_status_anon_probe_sends_one_request(mock_create_fs):
+    # The anonymous probe must not list the bucket root: on a public bucket
+    # with many objects at the root, _ls pages through all of them before
+    # every read_storage.
+    pages = [
+        {"kind": "storage#objects", "items": [{"name": f"{i}"}], "nextPageToken": "t"}
+        for i in range(3)
+    ]
+    pages[-1].pop("nextPageToken")
+    anon_fs = GCSFileSystem(token="anon", skip_instance_cache=True)  # noqa: S106
+    mock_create_fs.return_value = anon_fs
+    with patch.object(anon_fs, "_call", AsyncMock(side_effect=pages)) as mock_call:
+        assert GCSClient.bucket_status("b") == BucketStatus(True, "anonymous")
+
+    mock_call.assert_called_once_with("GET", "b/{}/o", "b", maxResults=1, json_out=True)
+    mock_create_fs.assert_called_once_with(anon=True)
 
 
 @pytest.mark.parametrize(
